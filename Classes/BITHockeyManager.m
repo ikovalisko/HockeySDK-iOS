@@ -30,7 +30,9 @@
 #import "HockeySDK.h"
 #import "HockeySDKPrivate.h"
 
+#if HOCKEYSDK_FEATURE_CRASH_REPORTER || HOCKEYSDK_FEATURE_FEEDBACK || HOCKEYSDK_FEATURE_UPDATES || HOCKEYSDK_FEATURE_AUTHENTICATOR || HOCKEYSDK_FEATURE_STORE_UPDATES
 #import "BITHockeyBaseManagerPrivate.h"
+#endif
 
 #import "BITHockeyHelper.h"
 #import "BITHockeyAppClient.h"
@@ -140,18 +142,27 @@ bitstadium_info_t bitstadium_library_info __attribute__((section("__TEXT,__bit_h
     
     _hockeyAppClient = nil;
     
+#if HOCKEYSDK_FEATURE_CRASH_REPORTER
     _disableCrashManager = NO;
+#endif
+#if HOCKEYSDK_FEATURE_UPDATES
     _disableUpdateManager = NO;
+#endif
+#if HOCKEYSDK_FEATURE_FEEDBACK
     _disableFeedbackManager = NO;
+#endif
 
+#if HOCKEYSDK_FEATURE_STORE_UPDATES
     _enableStoreUpdateManager = NO;
+#endif
     
     _appStoreEnvironment = NO;
     _startManagerIsInvoked = NO;
     _startUpdateManagerIsInvoked = NO;
     
     _liveIdentifier = nil;
-    _installString = bit_appAnonID();
+    _installString = bit_appAnonID(NO);
+    _disableInstallTracking = NO;
     
 #if !TARGET_IPHONE_SIMULATOR
     // check if we are really in an app store environment
@@ -219,6 +230,10 @@ bitstadium_info_t bitstadium_library_info __attribute__((section("__TEXT,__bit_h
   
   if (![self isSetUpOnMainThread]) return;
   
+  if ([self isAppStoreEnvironment] && [self isInstallTrackingDisabled]) {
+    _installString = bit_appAnonID(YES);
+  }
+
   BITHockeyLog(@"INFO: Starting HockeyManager");
   _startManagerIsInvoked = YES;
   
@@ -373,12 +388,18 @@ bitstadium_info_t bitstadium_library_info __attribute__((section("__TEXT,__bit_h
     }
 #endif /* HOCKEYSDK_FEATURE_FEEDBACK */
     
-#if HOCKEYSDK_FEATURE_AUTHENTICATOR
-    if (_authenticator) {
-      _authenticator.delegate = _delegate;
+#if HOCKEYSDK_FEATURE_STORE_UPDATES
+    if (_storeUpdateManager) {
+      _storeUpdateManager.delegate = _delegate;
     }
-#endif /* HOCKEYSDK_FEATURE_AUTHENTICATOR */
+#endif /* HOCKEYSDK_FEATURE_STORE_UPDATES */
   }
+  
+#if HOCKEYSDK_FEATURE_AUTHENTICATOR
+  if (_authenticator) {
+    _authenticator.delegate = _delegate;
+  }
+#endif /* HOCKEYSDK_FEATURE_AUTHENTICATOR */
 }
 
 - (void)modifyKeychainUserValue:(NSString *)value forKey:(NSString *)key {
@@ -517,28 +538,48 @@ bitstadium_info_t bitstadium_library_info __attribute__((section("__TEXT,__bit_h
   
   BITHockeyLog(@"INFO: Sending integration workflow ping to %@", integrationPath);
   
-  [[self hockeyAppClient] postPath:integrationPath
-                        parameters:@{@"timestamp": timeString,
-                                     @"sdk": BITHOCKEY_NAME,
-                                     @"sdk_version": BITHOCKEY_VERSION,
-                                     @"bundle_version": [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleVersion"]
-                                     }
-                        completion:^(BITHTTPOperation *operation, NSData* responseData, NSError *error) {
-                          switch (operation.response.statusCode) {
-                            case 400:
-                              BITHockeyLog(@"ERROR: App ID not found");
-                              break;
-                            case 201:
-                              BITHockeyLog(@"INFO: Ping accepted.");
-                              break;
-                            case 200:
-                              BITHockeyLog(@"INFO: Ping accepted. Server already knows.");
-                              break;
-                            default:
-                              BITHockeyLog(@"ERROR: Unknown error");
-                              break;
-                          }
-                        }];
+  NSDictionary *params = @{@"timestamp": timeString,
+                           @"sdk": BITHOCKEY_NAME,
+                           @"sdk_version": BITHOCKEY_VERSION,
+                           @"bundle_version": [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleVersion"]
+                           };
+  
+  id nsurlsessionClass = NSClassFromString(@"NSURLSessionUploadTask");
+  if (nsurlsessionClass && !bit_isRunningInAppExtension()) {
+    NSURLSessionConfiguration *sessionConfiguration = [NSURLSessionConfiguration defaultSessionConfiguration];
+    NSURLSession *session = [NSURLSession sessionWithConfiguration:sessionConfiguration];
+    NSURLRequest *request = [[self hockeyAppClient] requestWithMethod:@"POST" path:integrationPath parameters:params];
+    NSURLSessionDataTask *task = [session dataTaskWithRequest:request
+                                            completionHandler: ^(NSData *data, NSURLResponse *response, NSError *error) {
+                                              NSHTTPURLResponse *httpResponse = (NSHTTPURLResponse*) response;
+                                              [self logPingMessageForStatusCode:httpResponse.statusCode];
+                                            }];
+    [task resume];
+  }else{
+    [[self hockeyAppClient] postPath:integrationPath
+                          parameters:params
+                          completion:^(BITHTTPOperation *operation, NSData* responseData, NSError *error) {
+                            [self logPingMessageForStatusCode:operation.response.statusCode];
+                          }];
+  }
+  
+}
+
+- (void)logPingMessageForStatusCode:(NSInteger)statusCode {
+  switch (statusCode) {
+    case 400:
+      BITHockeyLog(@"ERROR: App ID not found");
+      break;
+    case 201:
+      BITHockeyLog(@"INFO: Ping accepted.");
+      break;
+    case 200:
+      BITHockeyLog(@"INFO: Ping accepted. Server already knows.");
+      break;
+    default:
+      BITHockeyLog(@"ERROR: Unknown error");
+      break;
+  }
 }
 
 - (void)validateStartManagerIsInvoked {
@@ -624,6 +665,7 @@ bitstadium_info_t bitstadium_library_info __attribute__((section("__TEXT,__bit_h
 #if HOCKEYSDK_FEATURE_STORE_UPDATES
     BITHockeyLog(@"INFO: Setup StoreUpdateManager");
     _storeUpdateManager = [[BITStoreUpdateManager alloc] initWithAppIdentifier:_appIdentifier isAppStoreEnvironment:_appStoreEnvironment];
+    _storeUpdateManager.delegate = _delegate;
 #endif /* HOCKEYSDK_FEATURE_STORE_UPDATES */
     
 #if HOCKEYSDK_FEATURE_FEEDBACK
